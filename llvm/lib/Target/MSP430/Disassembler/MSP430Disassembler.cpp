@@ -44,6 +44,10 @@ class MSP430Disassembler : public MCDisassembler {
                                 ArrayRef<uint8_t> Bytes, uint64_t Address,
                                 raw_ostream &CStream) const;
 
+  DecodeStatus getInstructionX(MCInst &MI, uint64_t &Size,
+                               ArrayRef<uint8_t> Bytes, uint64_t Address,
+                               raw_ostream &CStream) const;
+
 public:
   MSP430Disassembler(const MCSubtargetInfo &STI, MCContext &Ctx)
       : MCDisassembler(STI, Ctx) {}
@@ -115,6 +119,17 @@ static DecodeStatus DecodeCGImm(MCInst &MI, uint64_t Bits, uint64_t Address,
   case 0x23: Imm =  2; break;
   case 0x33: Imm = -1; break;
   }
+  MI.addOperand(MCOperand::createImm(Imm));
+  return MCDisassembler::Success;
+}
+
+/// Decode the repetition count from the extension word in a 430X extended
+/// instruction.
+static DecodeStatus decodeRptImm(MCInst &MI, uint64_t Bits, uint64_t Address,
+                                 const MCDisassembler *Decoder) {
+  if (Bits >= 16)
+    return MCDisassembler::Fail;
+  int64_t Imm = Bits + 1;
   MI.addOperand(MCOperand::createImm(Imm));
   return MCDisassembler::Success;
 }
@@ -353,6 +368,31 @@ DecodeStatus MSP430Disassembler::getInstructionCJ(MCInst &MI, uint64_t &Size,
   return DecodeStatus::Success;
 }
 
+static bool isExtensionWord(uint64_t Word) { return (Word & 0xf800) == 0x1800; }
+
+DecodeStatus MSP430Disassembler::getInstructionX(MCInst &MI, uint64_t &Size,
+                                                 ArrayRef<uint8_t> Bytes,
+                                                 uint64_t Address,
+                                                 raw_ostream &CStream) const {
+  uint64_t Insn = support::endian::read16le(Bytes.data());
+  unsigned Words = 1;
+  if (isExtensionWord(Insn)) {
+    if (Bytes.size() < 4) {
+      Size = 2;
+      return DecodeStatus::Fail;
+    }
+    Insn |= (uint64_t)support::endian::read16le(Bytes.data() + 2) << 16;
+    Words = 2;
+  }
+
+  const uint8_t *DecoderTable =
+      Words == 2 ? DecoderTableMSP430X32 : DecoderTableMSP430X16;
+  DecodeStatus Result =
+      decodeInstruction(DecoderTable, MI, Insn, Address, this, STI);
+  Size = Result == DecodeStatus::Fail ? 2 : Words * 2;
+  return Result;
+}
+
 DecodeStatus MSP430Disassembler::getInstruction(MCInst &MI, uint64_t &Size,
                                                 ArrayRef<uint8_t> Bytes,
                                                 uint64_t Address,
@@ -366,6 +406,10 @@ DecodeStatus MSP430Disassembler::getInstruction(MCInst &MI, uint64_t &Size,
   unsigned Opc = fieldFromInstruction(Insn, 13, 3);
   switch (Opc) {
   case 0:
+    // 0x0000-0x0fff are MSP430X address instructions, 0x1800-0x1fff are
+    // extension words.
+    if (!(Insn & 0x1000) || isExtensionWord(Insn))
+      return getInstructionX(MI, Size, Bytes, Address, CStream);
     return getInstructionII(MI, Size, Bytes, Address, CStream);
   case 1:
     return getInstructionCJ(MI, Size, Bytes, Address, CStream);
